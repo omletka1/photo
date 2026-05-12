@@ -37,4 +37,8 @@ class ContactRequest extends ActiveRecord
             'contacts' => 'Контактная информация',
         ];
     }
+    public function getUser()
+    {
+        return $this->hasOne(\app\models\User::class, ['id' => 'user_id']);
+    }
 }

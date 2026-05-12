@@ -2,6 +2,15 @@
 
 return [
     'adminEmail' => 'admin@example.com',
-    'senderEmail' => 'noreply@example.com',
-    'senderName' => 'Example.com mailer',
+    'senderEmail' => 'omlet.ka@ya.ru', // ← ТВОЙ яндекс-почтовый ящик
+    'senderName' => 'Photo Studio',
+
+    'mailer' => [
+        'enabled' => true,
+        'host' => 'smtp.yandex.ru',
+        'port' => 587,
+        'encryption' => 'tls',
+        'username' => 'omlet.ka@ya.ru',
+        'password' => 'enkbsykivnqohgfl',
+    ],
 ];

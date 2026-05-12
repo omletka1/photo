@@ -2,15 +2,20 @@
 
 namespace app\models;
 
+use Yii;
 use yii\behaviors\TimestampBehavior;
 use yii\db\ActiveRecord;
 use yii\web\IdentityInterface;
 
 class User extends ActiveRecord implements IdentityInterface
 {
+    public $avatarFile;
     public $new_password;
     public $new_password_repeat;
-
+    const STATUS_WAIT = 0;
+    const STATUS_ACTIVE = 1;
+    const VERIFICATION_CODE_LENGTH = 6;
+    const VERIFICATION_CODE_EXPIRE = 900; // 15 минут в секундах
     public static function tableName()
     {
         return 'user';
@@ -73,11 +78,28 @@ class User extends ActiveRecord implements IdentityInterface
     public function rules()
     {
         return [
-            [['username', 'email'], 'required'],
-            [['username', 'email'], 'string', 'max' => 255],
+            // Файлы
+            [['avatarFile'], 'file', 'extensions' => 'png, jpg, jpeg', 'maxSize' => 1024 * 1024 * 2],
+
+            // Обязательные поля
+            [['username', 'email', 'name', 'surname'], 'required'],
+
+            // Строковые поля с ограничением длины
+            [['username', 'email', 'name', 'surname'], 'string', 'max' => 255],
+            [['bio'], 'string', 'max' => 500], // опционально: лимит для био
+            [['website'], 'string', 'max' => 255],
+            [['verification_code', 'verification_code_expire'], 'safe'],
+            // Валидация email и URL
             ['email', 'email'],
-            [['new_password', 'new_password_repeat'], 'string', 'min' => 6],
-            ['new_password_repeat', 'compare', 'compareAttribute' => 'new_password', 'message' => 'Пароли не совпадают.'],
+            ['website', 'url', 'defaultScheme' => 'http', 'skipOnEmpty' => true, 'message' => 'Введите корректную ссылку (например, https://...)'],
+
+            // 🔥 ВАЖНО: разрешаем массовое присваивание для этих полей
+            [['bio', 'website', 'name', 'surname'], 'safe'],
+
+            // Виртуальные поля для формы (пароль)
+            [['new_password', 'new_password_repeat'], 'safe'],
+            ['new_password', 'string', 'min' => 8],
+            ['new_password_repeat', 'compare', 'compareAttribute' => 'new_password', 'message' => 'Пароли не совпадают'],
         ];
     }
 
@@ -90,12 +112,52 @@ class User extends ActiveRecord implements IdentityInterface
             'new_password_repeat' => 'Повторите новый пароль',
         ];
     }
-
-    public function beforeSave($insert)
+    public function uploadAvatar()
     {
-        if (!empty($this->new_password)) {
-            $this->password = \Yii::$app->security->generatePasswordHash($this->new_password);
+        if ($this->avatarFile) {
+
+            $folder = Yii::getAlias('@webroot/uploads/avatars');
+
+            if (!is_dir($folder)) {
+                mkdir($folder, 0777, true);
+            }
+
+            $fileName = $this->id . '.' . $this->avatarFile->extension;
+
+            $fullPath = $folder . '/' . $fileName;
+
+            if ($this->avatarFile->saveAs($fullPath)) {
+                $this->avatar = 'uploads/avatars/' . $fileName;
+                return true;
+            }
         }
-        return parent::beforeSave($insert);
+
+        return false;
+    }
+    public function generateVerificationCode(): string
+    {
+        $this->verification_code = str_pad(random_int(0, 999999), self::VERIFICATION_CODE_LENGTH, '0', STR_PAD_LEFT);
+        $this->verification_code_expire = time() + self::VERIFICATION_CODE_EXPIRE;
+        return $this->verification_code;
+    }
+
+    // 🔥 Проверка кода и активация пользователя
+    public function verifyCode(string $code): bool
+    {
+        if ($this->status !== self::STATUS_WAIT) return false;
+        if ($this->verification_code !== $code) return false;
+        if ($this->verification_code_expire < time()) return false; // Истёк
+
+        $this->status = self::STATUS_ACTIVE;
+        $this->verification_code = null;
+        $this->verification_code_expire = null;
+        return $this->save(false);
+    }
+
+    // 🔥 Сброс кода (для повторной отправки)
+    public function resetVerificationCode()
+    {
+        $this->verification_code = null;
+        $this->verification_code_expire = null;
     }
 }

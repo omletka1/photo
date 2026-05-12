@@ -65,7 +65,11 @@ class Konkurs extends \yii\db\ActiveRecord
     {
         return $this->hasMany(Result::class, ['konkurs_id' => 'id']);
     }
-
+    public function getNominations()
+    {
+        return $this->hasMany(Nomination::class, ['id' => 'nomination_id'])
+            ->viaTable('konkurs_nominations', ['konkurs_id' => 'id']);
+    }
     /**
      * Gets query for [[Submissions]].
      *

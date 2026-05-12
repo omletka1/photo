@@ -47,6 +47,14 @@ class Submission extends \yii\db\ActiveRecord
             [['image1', 'image2', 'image3', 'image4', 'image5'], 'string', 'max' => 255],
             [['imageFile'], 'safe'],
             [['imageFile'], 'file', 'extensions' => 'jpg, png, jpeg', 'maxFiles' => 5],
+
+            // 🔥 Уникальность: один пользователь — одна работа на конкурс
+            [['user_id', 'konkurs_id'], 'unique',
+                'targetClass' => Submission::class,
+                'targetAttribute' => ['user_id', 'konkurs_id'],
+                'message' => 'Вы уже подавали работу в этот конкурс.'
+            ],
+
             [['user_id'], 'exist', 'skipOnError' => true, 'targetClass' => User::class, 'targetAttribute' => ['user_id' => 'id']],
             [['konkurs_id'], 'exist', 'skipOnError' => true, 'targetClass' => Konkurs::class, 'targetAttribute' => ['konkurs_id' => 'id']],
         ];
@@ -114,22 +122,38 @@ class Submission extends \yii\db\ActiveRecord
             $this->addError('imageFile', 'Не выбраны файлы для загрузки');
             return false;
         }
-        $uploadPath = Yii::getAlias('@webroot/uploads');
-        if (!file_exists($uploadPath)) {
+
+        $userId = Yii::$app->user->id;
+
+        // 📁 папка: uploads/works/user_13/
+        $uploadPath = Yii::getAlias("@webroot/uploads/works/user_{$userId}/");
+
+        if (!is_dir($uploadPath)) {
             mkdir($uploadPath, 0777, true);
         }
+
         $successCount = 0;
+
         foreach ($this->imageFile as $key => $file) {
+
             if ($key >= 5) break;
 
             $fileName = uniqid('img_') . '.' . $file->extension;
-            $filePath = "uploads/{$fileName}";
 
-            if ($file->saveAs($filePath)) {
-                $this->{'image' . ($key + 1)} = $filePath;
+            // ❗ ФИЗИЧЕСКИЙ ПУТЬ (куда сохраняем)
+            $fullPath = $uploadPath . $fileName;
+
+            if ($file->saveAs($fullPath)) {
+
+                // ❗ ПУТЬ ДЛЯ БАЗЫ (URL)
+                $relativePath = "uploads/works/user_{$userId}/" . $fileName;
+
+                $this->{'image' . ($key + 1)} = $relativePath;
+
                 $successCount++;
             }
         }
+
         if ($successCount === 0) {
             $this->addError('imageFile', 'Не удалось сохранить ни одного файла');
             return false;
@@ -164,5 +188,16 @@ class Submission extends \yii\db\ActiveRecord
         return $this->getVotes()->count();
     }
 
-
+    /**
+     * Связь с номинацией
+     */
+    public function getNomination()
+    {
+        return $this->hasOne(\app\models\Nomination::class, ['id' => 'nomination_id']);
+    }
+    public function getJuryRatings()
+    {
+        return $this->hasMany(JuryRating::class, ['submission_id' => 'id'])
+            ->with('nomination');
+    }
 }

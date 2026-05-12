@@ -12,10 +12,14 @@ use app\models\Nomination;
 use app\models\Organizers;
 use app\models\SignupForm;
 use app\models\Submission;
+use app\models\User;
+use app\models\VerifyCodeForm;
 use app\models\Vote;
 use Yii;
+use yii\db\Expression;
 use yii\db\Query;
 use yii\filters\AccessControl;
+use yii\helpers\Html;
 use yii\web\Controller;
 use yii\web\Response;
 use yii\filters\VerbFilter;
@@ -58,6 +62,20 @@ class SiteController extends Controller
         ];
     }
 
+    public function init()
+    {
+        parent::init();
+
+        // 🔥 Автоматически закрываем просроченные конкурсы (только для демо!)
+        // В реальном проекте это лучше вынести в cron-задачу
+        try {
+            \Yii::$app->db->createCommand()
+                ->update('konkurs', ['status' => 'закрыт'], 'status = "открыт" AND end_date < CURDATE()')
+                ->execute();
+        } catch (\Exception $e) {
+            // Если БД недоступна или ошибка, просто игнорируем, чтобы сайт не падал
+        }
+    }
 
     /**
      * {@inheritdoc}
@@ -82,32 +100,113 @@ class SiteController extends Controller
      */
     public function actionIndex()
     {
-        $konkursy = Konkurs::find()
-            ->orderBy(['start_date' => SORT_DESC])
-            ->limit(2)
+        // 🔥 1. Активные конкурсы (открытые, не просроченные)
+        $activeContests = Konkurs::find()
+            ->where(['status' => 'открыт'])
+            ->andWhere(['>=', 'end_date', date('Y-m-d')])
+            ->orderBy(['start_date' => SORT_ASC])
+            ->limit(3)
             ->all();
 
-        $nominations = Nomination::find()
-            ->limit(2)
+// 🔥 Популярные конкурсы (по количеству поданных работ)
+// 🔥 Популярные конкурсы (по количеству поданных работ)
+        $popularContests = (new \yii\db\Query())
+            ->select([
+                'konkurs.*',
+                'COUNT(submission.id) as work_count'
+            ])
+            ->from(['konkurs' => 'konkurs'])
+            ->leftJoin('submission', 'submission.konkurs_id = konkurs.id')
+            ->where(['konkurs.status' => 'открыт'])
+            ->groupBy('konkurs.id')
+            ->orderBy(['work_count' => SORT_DESC, 'konkurs.start_date' => SORT_DESC])
+            ->limit(3)
+            ->all(); // ← возвращает массив массивов, НЕ моделей
+
+
+        // 🔥 3. Последние работы (для галереи)
+        $recentWorks = Submission::find()
+            ->where(['not', ['image1' => '']])
+            ->orderBy(['created_at' => SORT_DESC])
+            ->limit(8)
             ->all();
 
-        $dataProvider = new ActiveDataProvider([
-            'query' => Nomination::find(),
-            'pagination' => [
-                'pageSize' => 10,
-            ],
-            'sort' => [
-                'defaultOrder' => [
-                    'title' => SORT_ASC,
-                ]
-            ],
+        // 🔥 4. Статистика
+        $stats = [
+            'users' => \app\models\User::find()->count(),
+            'submissions' => \app\models\Submission::find()->count(),
+            'nominations' => \app\models\Nomination::find()->count(),
+            'contests' => \app\models\Konkurs::find()->where(['status' => 'открыт'])->count(), // ← вернули 'contests'
+        ];
 
-        ]);
+        // 🔥 5. Умные рекомендации
+        $recommended = $this->getRecommendedSubmissions(8);
+
         return $this->render('index', [
-            'konkursy' => $konkursy,
-            'nominations' => $nominations,
-            'dataProvider' => $dataProvider,
+            'activeContests' => $activeContests,
+            'popularContests' => $popularContests,
+            'recentWorks' => $recentWorks,
+            'stats' => $stats,
+            'recommended' => $recommended,
         ]);
+    }
+
+    /**
+     * 🔥 Умная система рекомендаций
+     * - Для авторизованных: на основе лайков + популярных в тех же номинациях
+     * - Для гостей: топ по голосованиям + свежие работы
+     */
+    /**
+     * 🔥 Умная система рекомендаций (исправленная версия)
+     */
+    private function getRecommendedSubmissions($limit = 8)
+    {
+        $userId = Yii::$app->user->id;
+
+        if (!Yii::$app->user->isGuest) {
+            // Получаем ID работ, которые пользователь лайкнул
+            $likedSubmissionIds = Vote::find()
+                ->where(['user_id' => $userId])
+                ->select('submission_id')
+                ->column();
+
+            if (!empty($likedSubmissionIds)) {
+                // Получаем номинации лайкнутых работ
+                $likedNominationIds = Submission::find()
+                    ->where(['id' => $likedSubmissionIds])
+                    ->andWhere(['not', ['nomination_id' => null]])
+                    ->select('nomination_id')
+                    ->column();
+
+                if (!empty($likedNominationIds)) {
+                    // Рекомендации: работы в тех же номинациях, которые пользователь ещё не лайкал
+                    return Submission::find()
+                        ->where(['nomination_id' => $likedNominationIds])
+                        ->andWhere(['not in', 'id', $likedSubmissionIds])
+                        ->andWhere(['not', ['image1' => '']])
+                        ->orderBy(['submission.created_at' => SORT_DESC])
+                        ->limit($limit)
+                        ->all();
+                }
+            }
+        }
+
+        // 🔥 Fallback: популярные работы по количеству голосов
+        // Используем подзапрос с явным алиасом и правильной сортировкой
+        $subQuery = (new \yii\db\Query())
+            ->select(['submission_id', 'cnt' => new \yii\db\Expression('COUNT(*)')])
+            ->from('vote')
+            ->groupBy('submission_id');
+
+        return Submission::find()
+            ->select(['submission.*', 'vote_stats.cnt'])
+            ->from(['submission' => 'submission'])
+            ->leftJoin(['vote_stats' => $subQuery], 'vote_stats.submission_id = submission.id')
+            ->where(['not', ['submission.image1' => '']])
+            // 🔥 ВАЖНО: указываем таблицу для vote_stats.cnt и submission.created_at
+            ->orderBy(['vote_stats.cnt' => SORT_DESC, 'submission.created_at' => SORT_DESC])
+            ->limit($limit)
+            ->all();
     }
 
     /**
@@ -149,313 +248,200 @@ class SiteController extends Controller
      *
      * @return Response|string
      */
-    public function actionContact()
-    {
-        $model = new ContactForm();
-        if ($model->load(Yii::$app->request->post()) && $model->contact(Yii::$app->params['adminEmail'])) {
-            Yii::$app->session->setFlash('contactFormSubmitted');
-
-            return $this->refresh();
-        }
-        return $this->render('contact', [
-            'model' => $model,
-        ]);
-    }
-
-    /**
-     * Displays about page.
-     *
-     * @return string
-     */
-    public function actionAbout()
-    {
-        return $this->render('about');
-    }
-
-    public function actionComend()
-    {
-        $model = new Comments();
-        if ($model->load(Yii::$app->request->post()) && $model->save()) {
-            return $this->goBack();
-        }
-        return $this->render('comend',
-            [
-                'model' => $model
-            ]);
-    }
-
-    public function actionCategory()
-    {
-        $categorys = Category::find()->all();
-        return $this->render('category', ['categorys' => $categorys]);
-    }
-
-    public function actionNews($id)
-    {
-        $category = Category::findOne($id);
-        $news = News::find()->where(['category_id' => $id])->all();
-
-        return $this->render('news', [
-            'category' => $category,
-            'news' => $news,
-        ]);
-    }
-
-    public function actionSignup()
-    {
-        $us = new SignupForm();
-        if ($us->load(Yii::$app->request->post()) && $us->signup()) {
-            return $this->goHome();
-        }
-        return $this->render('signup', [
-            'us' => $us
-        ]);
-    }
-
-    public function actionVote()
-    {
-        Yii::$app->response->format = Response::FORMAT_JSON;
-        Yii::info('Vote request received: ' . print_r(Yii::$app->request->post(), true), 'vote');
-
-        try {
-            if (Yii::$app->user->isGuest) {
-                throw new \yii\web\ForbiddenHttpException('Авторизуйтесь, чтобы голосовать');
-            }
-
-            $submissionId = Yii::$app->request->post('submissionId');
-            Yii::info('Submission ID: ' . $submissionId, 'vote');
-
-            if (empty($submissionId)) {
-                throw new \yii\web\BadRequestHttpException('ID работы не указан');
-            }
-
-            $userId = Yii::$app->user->id;
-            Yii::info('User ID: ' . $userId, 'vote');
-
-            $transaction = Yii::$app->db->beginTransaction();
-
-            $existing = Vote::findOne([
-                'user_id' => $userId,
-                'submission_id' => $submissionId
-            ]);
-
-            if ($existing) {
-                Yii::info('Existing vote found, deleting...', 'vote');
-                if (!$existing->delete()) {
-                    throw new \RuntimeException('Не удалось отменить голос');
-                }
-                $voted = false;
-            } else {
-                Yii::info('Creating new vote...', 'vote');
-                $vote = new Vote();
-                $vote->user_id = $userId;
-                $vote->submission_id = $submissionId;
-                $vote->created_at = date('Y-m-d H:i:s');
-
-                if (!$vote->save()) {
-                    Yii::error('Failed to save vote: ' . print_r($vote->errors, true), 'vote');
-                    throw new \RuntimeException('Не удалось сохранить голос: '
-                        . implode(', ', $vote->getFirstErrors()));
-                }
-                $voted = true;
-            }
-
-            $voteCount = (int)Vote::find()
-                ->where(['submission_id' => $submissionId])
-                ->count();
-
-            $transaction->commit();
-
-            Yii::info('Vote processed successfully. Count: ' . $voteCount, 'vote');
-
-            return [
-                'success' => true,
-                'voteCount' => $voteCount,
-                'voted' => $voted,
-                'message' => $voted ? 'Ваш голос учтён' : 'Голос отменён'
-            ];
-
-        } catch (\yii\web\HttpException $e) {
-            Yii::warning($e->getMessage(), 'vote');
-            return ['success' => false, 'message' => $e->getMessage()];
-
-        } catch (\Exception $e) {
-            if (isset($transaction)) {
-                $transaction->rollBack();
-            }
-            Yii::error('Vote error: ' . $e->getMessage() . "\n" . $e->getTraceAsString(), 'vote');
-            return [
-                'success' => false,
-                'message' => 'Ошибка при обработке запроса',
-                'debug' => YII_DEBUG ? $e->getMessage() : null
-            ];
-        }
-    }
 
 
-    public function actionSubmissions()
-    {
-        $konkursFilter = Yii::$app->request->get('konkurs');
-        $baseImageUrl = Yii::getAlias('@web/uploads/');
 
-        $query = (new Query())
-            ->select([
-                'submission.*',
-                'user.name as user_name',
-                'user.surname as user_surname',
-                'konkurs.title as konkurs_title',
-                'COUNT(vote.id) as voteCount'
-            ])
-            ->addSelect([
-                new \yii\db\Expression('SUM(CASE WHEN vote.user_id = :userId THEN 1 ELSE 0 END) as userVoted', [':userId' => Yii::$app->user->id])
-            ])
-            ->from('submission')
-            ->leftJoin('user', 'user.id = submission.user_id')
-            ->leftJoin('konkurs', 'konkurs.id = submission.konkurs_id')
-            ->leftJoin('vote', 'vote.submission_id = submission.id')
-            ->groupBy('submission.id')
-            ->orderBy(['voteCount' => SORT_DESC, 'submission.created_at' => SORT_DESC]);
-
-
-        if ($konkursFilter) {
-            $query->andWhere(['submission.konkurs_id' => $konkursFilter]);
-        }
-
-        $dataProvider = new ActiveDataProvider([
-            'query' => $query,
-            'pagination' => [
-                'pageSize' => 12,
-            ],
-        ]);
-
-        return $this->render('submissions', [
-            'dataProvider' => $dataProvider,
-            'baseImageUrl' => $baseImageUrl,
-            'konkursList' => Konkurs::find()->all(),
-            'konkursFilter' => $konkursFilter,
-        ]);
-    }
 
     /**
      * Список работ участников
      * @return string HTML-страница
      */
-    public function actionSubmission()
-    {
-        if (Yii::$app->user->isGuest) {
-            return $this->redirect(['site/login']);
-        }
-        $model = new Submission();
-        $model->user_id = Yii::$app->user->id;
-
-        if (Yii::$app->request->isPost) {
-            $model->load(Yii::$app->request->post());
-
-            $model->imageFile = UploadedFile::getInstances($model, 'imageFile');
-
-            if ($model->validate() && $model->upload()) {
-                Yii::$app->session->setFlash('success',
-                    'Работа успешно сохранена! Загружено ' .
-                    count($model->imageFile) . ' файлов.');
-                return $this->refresh();
-            } else {
-                Yii::$app->session->setFlash('ошибка',
-                    'Ошибка сохранения: ' .
-                    print_r($model->errors, true));
-            }
-        }
-
-        return $this->render('submission', ['model' => $model]);
-    }
 
     public function actionContacts()
     {
-        if (Yii::$app->user->isGuest) {
-            return $this->redirect(['/site/login']);
+        $model = new \app\models\ContactRequest();
+
+        // 🔥 Если авторизован — подставляем ID и контакты
+        if (!Yii::$app->user->isGuest) {
+            $model->user_id = Yii::$app->user->id;
+            $model->contacts = Yii::$app->user->identity->email;
         }
 
-        $model = new ContactRequest();
-        $model->user_id = Yii::$app->user->id;
-
-        if ($model->load(Yii::$app->request->post()) && $model->save()) {
-            Yii::$app->session->setFlash('contactFormSubmitted', true);
-            return $this->refresh();
+        if ($model->load(Yii::$app->request->post()) && $model->validate()) {
+            if ($model->save()) {
+                Yii::$app->session->setFlash('contactFormSubmitted', true);
+                return $this->refresh();
+            }
         }
 
         return $this->render('contacts', ['model' => $model]);
     }
 
-    public function actionRules()
+    /**
+     * Страница ввода кода подтверждения
+     */
+    /**
+     * Отправка письма с кодом подтверждения
+     */
+
+    /**
+     * Регистрация: сохраняем данные в сессию, отправляем код, НЕ создаём пользователя
+     */
+    public function actionSignup()
     {
-        return $this->render('rules');
-    }
-    public function actionOrganizers()
-    {
-        $organizers = Organizers::find()->all();
-        return $this->render('organizers', [
-            'organizers' => $organizers,
-        ]);
-    }
+        $form = new SignupForm();
 
+        if (Yii::$app->request->isPost && $form->load(Yii::$app->request->post())) {
+            Yii::info("📥 Form loaded: " . json_encode($form->attributes), __METHOD__);
 
-    public function actionResult()
-    {
-        $closedContests = Konkurs::find()->where(['status' => 'закрыт'])->all();
+            if ($form->validate()) {
+                try {
+                    $code = str_pad(random_int(0, 999999), 6, '0', STR_PAD_LEFT);
+                    $expire = time() + 900;
 
-        $results = [];
+                    Yii::$app->session->set('pending_user', [
+                        'username'  => $form->username,
+                        'email'     => $form->email,
+                        'name'      => $form->name,
+                        'surname'   => $form->surname,
+                        'password'  => Yii::$app->security->generatePasswordHash($form->password),
+                    ]);
+                    Yii::$app->session->set('pending_code', $code);
+                    Yii::$app->session->set('pending_code_expire', $expire);
 
-        foreach ($closedContests as $konkurs) {
-            // Получаем работы этого конкурса
-            $works = Submission::find()
-                ->where(['konkurs_id' => $konkurs->id])
-                ->orderBy(['status' => SORT_ASC])
-                ->all();
+                    $this->sendVerificationEmail($form->email, $form->name, $code);
 
-            $results[] = [
-                'konkurs' => $konkurs,
-                'works' => $works,
-            ];
+                    Yii::info("✅ Session saved, email sent. Redirecting...", __METHOD__);
+                    Yii::$app->session->setFlash('success', '📧 Код отправлен на ' . Html::encode($form->email));
+                    return $this->redirect(['/site/verify-code', 'email' => $form->email]);
+
+                } catch (\Exception $e) {
+                    Yii::error("❌ Signup exception: " . $e->getMessage(), __METHOD__);
+                    Yii::$app->session->setFlash('error', '❌ Ошибка сервера: ' . $e->getMessage());
+                }
+            } else {
+                Yii::warning("❌ Validation failed: " . json_encode($form->errors), __METHOD__);
+            }
         }
 
-        $baseImageUrl = Yii::getAlias('@web/') ;
-
-        return $this->render('result', [
-            'results' => $results,
-            'baseImageUrl' => $baseImageUrl,
-        ]);
+        return $this->render('signup', ['us' => $form]);
     }
 
-
-    public function actionNominations()
+    /**
+     * Проверка кода → только теперь создаём пользователя в БД
+     */
+    /**
+     * Проверка кода → только теперь создаём пользователя в БД
+     */
+    public function actionVerifyCode()
     {
-        $dataProvider = new ActiveDataProvider([
-            'query' => Nomination::find(),
-            'pagination' => [
-                'pageSize' => 10,
-            ],
-            'sort' => [
-                'defaultOrder' => [
-                    'title' => SORT_ASC,
-                ]
-            ],
-        ]);
+        $model = new VerifyCodeForm();
 
-        return $this->render('nominations', [
-            'dataProvider' => $dataProvider,
-        ]);
-    }
-
-    public function actionVotePage($id)
-    {
-        $submission = Submission::findOne($id);
-
-        if ($submission === null) {
-            return $this->render('error', ['message' => 'Работа не найдена']);
+        // 1. Загружаем данные из POST (если форма отправлена)
+        if (Yii::$app->request->isPost) {
+            $model->load(Yii::$app->request->post());
         }
 
-        // Выводим страницу голосования
-        return $this->render('vote', ['submission' => $submission]);
+        // 2. Если email не пришёл в POST, берём из GET (переход по ссылке из письма)
+        if (empty($model->email)) {
+            $model->email = Yii::$app->request->get('email');
+        }
+
+        // 3. Проверка наличия email
+        if (empty($model->email)) {
+            Yii::$app->session->setFlash('error', '❌ Email не указан');
+            return $this->redirect(['/site/signup']);
+        }
+
+        // 4. Проверка сессии
+        $pending = Yii::$app->session['pending_user'] ?? null;
+        $pendingCode = Yii::$app->session['pending_code'] ?? null;
+        $pendingExpire = Yii::$app->session['pending_code_expire'] ?? null;
+
+        if (!$pending || $model->email !== ($pending['email'] ?? null)) {
+            Yii::$app->session->setFlash('error', '❌ Сессия регистрации истекла или email не совпадает');
+            return $this->redirect(['/site/signup']);
+        }
+
+        // 5. Обработка отправки кода
+        if (Yii::$app->request->isPost && $model->validate()) {
+            if ($model->code === $pendingCode && time() <= $pendingExpire) {
+                $user = new User();
+                $user->username = $pending['username'];
+                $user->email = $pending['email'];
+                $user->name = $pending['name'];
+                $user->surname = $pending['surname'];
+                $user->password = $pending['password'];
+                $user->status = User::STATUS_ACTIVE;
+                $user->access_token = Yii::$app->security->generateRandomString();
+
+                if ($user->save()) {
+                    unset(Yii::$app->session['pending_user']);
+                    unset(Yii::$app->session['pending_code']);
+                    unset(Yii::$app->session['pending_code_expire']);
+
+                    Yii::$app->session->setFlash('success', '🎉 Аккаунт создан! Войдите в систему.');
+                    return $this->redirect(['/site/login']);
+                } else {
+                    Yii::$app->session->setFlash('error', '❌ Ошибка БД: ' . json_encode($user->getFirstErrors()));
+                }
+            } else {
+                Yii::$app->session->setFlash('error', time() > $pendingExpire ? '⏳ Код истёк' : '❌ Неверный код');
+            }
+        }
+
+        return $this->render('verify-code', ['model' => $model]);
     }
 
+    /**
+     * Повторная отправка кода (обновляет сессию)
+     */
+    public function actionResendCode($email)
+    {
+        // 1. Декодируем email, если он в base64
+        if (base64_encode(base64_decode($email, true)) === $email) {
+            $email = base64_decode($email);
+        }
 
+        // 2. Проверяем сессию
+        $pending = Yii::$app->session->get('pending_user');
+        if (!$pending || ($pending['email'] ?? '') !== $email) {
+            Yii::$app->session->setFlash('error', '❌ Нет активной сессии регистрации');
+            return $this->redirect(['/site/signup']);
+        }
+
+        // 3. Генерируем новый код
+        $code = str_pad(random_int(0, 999999), 6, '0', STR_PAD_LEFT);
+        $expire = time() + 900; // 15 минут
+
+        // 🔥 ПРАВИЛЬНОЕ сохранение в сессию (выбери один вариант):
+        // Вариант А (рекомендую):
+        Yii::$app->session->set('pending_code', $code);
+        Yii::$app->session->set('pending_code_expire', $expire);
+
+        // Вариант Б (тоже работает):
+        // Yii::$app->session['pending_code'] = $code;
+        // Yii::$app->session['pending_code_expire'] = $expire;
+
+        // 4. Отправляем письмо
+        $this->sendVerificationEmail($email, $pending['name'] ?? 'Пользователь', $code);
+
+        Yii::$app->session->setFlash('success', '📧 Новый код отправлен на ' . Html::encode($email));
+        return $this->redirect(['/site/verify-code', 'email' => $email]);
+    }
+
+    /**
+     * Хелпер отправки письма (принимает массив вместо модели User)
+     */
+    private function sendVerificationEmail($email, $name, $code)
+    {
+        return Yii::$app->mailer->compose('emailVerifyCode', [
+            'user' => ['email' => $email, 'name' => $name ?: 'Пользователь'],
+            'code' => $code,
+        ])
+            ->setFrom([Yii::$app->params['senderEmail'] => Yii::$app->params['senderName']])
+            ->setTo($email)
+            ->setSubject('Код подтверждения регистрации')
+            ->send();
+    }
 }
